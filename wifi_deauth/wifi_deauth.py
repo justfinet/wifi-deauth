@@ -41,11 +41,12 @@ class Interceptor:
     _PRINT_STATS_INTV = 1
     _DEAUTH_INTV = 0.100  # 100[ms]
     _DEAUTH_BURST = 5  # consecutive broadcast deauths per AP per loop
-    _CH_SNIFF_TO = 2
+    _CH_SNIFF_TO = 4  # per-channel dwell time during scan, longer = weak APs get more beacon chances
     _SSID_STR_PAD = 42  # total len 80
 
     def __init__(self, net_iface, skip_monitor_mode_setup, kill_networkmanager,
-                 ssid_name, bssid_addr, custom_channels, deauth_all_channels, autostart, debug_mode):
+                 ssid_name, bssid_addr, custom_channels, targets_file,
+                 deauth_all_channels, autostart, debug_mode):
         self.interface = net_iface
 
         self._max_consecutive_failed_send_lim = 5 / Interceptor._DEAUTH_INTV  # fails to send for 5 consecutive seconds
@@ -84,6 +85,9 @@ class Interceptor:
         self.log_debug(f"Selected target channels: {self._custom_target_ap_channels}")
 
         self._custom_target_ap_last_ch = 0  # to avoid overlapping
+
+        # manually supplied targets (MAC + channel) from a local file
+        self._manual_targets: List[SSID] = self._load_manual_targets(targets_file)
 
         self._deauth_all_channels = deauth_all_channels
 
@@ -135,6 +139,48 @@ class Interceptor:
                                     f" {list(supported_channels)}")
                         raise Exception("Unsupported channel")
         return ch_list
+
+    def _load_manual_targets(self, targets_file: Union[None, str]) -> List[SSID]:
+        """
+        Load manually written targets from a local file, one per line: <MAC> <channel>
+        ('#' comments and blank lines are ignored). Used for APs that are too weak
+        to show up in the scan but whose MAC/channel are known.
+        """
+        if targets_file is None:
+            return list()
+        targets = list()
+        try:
+            with open(targets_file, 'r') as f:
+                lines = f.readlines()
+        except OSError as exc:
+            print_error(f"Cannot read targets file -> {targets_file} ({exc})")
+            raise Exception("Bad targets file")
+
+        for line_num, line in enumerate(lines, start=1):
+            line = line.split('#', 1)[0].strip()  # strip comments
+            if not line:
+                continue
+            parts = line.replace(',', ' ').split()
+            if len(parts) != 2:
+                print_error(f"Targets file line {line_num}: expected '<MAC> <channel>', got -> {line}")
+                raise Exception("Bad targets file entry")
+            mac_addr, ch_str = parts
+            try:
+                mac_addr = Interceptor.verify_mac_addr(mac_addr)
+                ch_num = int(ch_str)
+            except Exception:
+                print_error(f"Targets file line {line_num}: invalid MAC or channel -> {line}")
+                raise Exception("Bad targets file entry")
+            band_type = BandType.T_50GHZ if ch_num > 14 else BandType.T_24GHZ
+            targets.append(SSID(f"manual:{mac_addr}", mac_addr, band_type))
+            targets[-1].add_channel(ch_num)
+
+        if targets:
+            print_info(f"Loaded {BOLD}{len(targets)}{RESET} manual target(s) from {BOLD}{targets_file}{RESET}")
+        else:
+            print_error(f"Targets file {targets_file} contains no valid entries")
+            raise Exception("Empty targets file")
+        return targets
 
     def _enable_monitor_mode(self):
         for cmd in [f"sudo ip link set {self.interface} down",
@@ -250,6 +296,11 @@ class Interceptor:
             for ssid_obj in band_ssids.values():
                 self._channel_range[ssid_obj.channel][ssid_obj.mac_addr] = copy.deepcopy(ssid_obj)
 
+        # manual targets from the targets file take part in selection as well,
+        # they may overlap with scanned ones (dedup by MAC happens after selection)
+        for ssid_obj in self._manual_targets:
+            self._channel_range[ssid_obj.channel][ssid_obj.mac_addr] = copy.deepcopy(ssid_obj)
+
         pref = '[   ] '
         printf(f"{DELIM}\n"
                f"{pref}{self._generate_ssid_str('SSID Name', 'Channel', 'MAC Address', len(pref))}")
@@ -265,6 +316,10 @@ class Interceptor:
                 pref = f"[{BOLD}{YELLOW}{str(ctr).rjust(3, ' ')}{RESET}] "
                 printf(f"{pref}{self._generate_ssid_str(ssid_obj.name, ssid_obj.channel, ssid_obj.mac_addr, preflen)}")
         if not target_map:
+            if self._manual_targets:
+                print_info(f"No APs were found by scanning, "
+                           f"but {len(self._manual_targets)} manual target(s) were loaded from the targets file")
+                return list(self._manual_targets)
             Interceptor.abort_run("Not APs were found, quitting...")
 
         printf(DELIM)
@@ -457,6 +512,10 @@ def main():
     parser.add_argument('-c', '--channels',
                         help='custom channels to scan / de-auth, separated by a comma (i.e -> 1,3,4)',
                         metavar="ch1,ch2", action='store', default=None, dest="custom_channels", required=False)
+    parser.add_argument('-t', '--targets-file',
+                        help='file with manually known targets, one "<MAC> <channel>" per line'
+                             ' (i.e -> 0c:4b:54:e2:9d:1f 1), added to the attack rotation',
+                        metavar="targets_file", action='store', default=None, dest="targets_file", required=False)
     parser.add_argument('-a', '--autostart',
                         help='autostart the de-auth loop (attacks the single found AP, or all found APs in rotation)',
                         action='store_true', default=False, dest="autostart", required=False)
@@ -473,6 +532,7 @@ def main():
                            ssid_name=pargs.custom_ssid,
                            bssid_addr=pargs.custom_bssid,
                            custom_channels=pargs.custom_channels,
+                           targets_file=pargs.targets_file,
                            deauth_all_channels=pargs.deauth_all_channels,
                            autostart=pargs.autostart,
                            debug_mode=pargs.debug_mode)
