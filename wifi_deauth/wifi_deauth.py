@@ -79,7 +79,7 @@ class Interceptor:
         self._custom_ssid_name: Union[str, None] = self.parse_custom_ssid_name(ssid_name)
         self.log_debug(f"Selected custom ssid name: {self._custom_ssid_name}")
         self._custom_bssid_addr: Union[str, None] = self.parse_custom_bssid_addr(bssid_addr)
-        self.log_debug(f"Selected custom bssid addr: {self._custom_ssid_name}")
+        self.log_debug(f"Selected custom bssid addr: {self._custom_bssid_addr}")
         self._custom_target_ap_channels: List[int] = self.parse_custom_channels(custom_channels)
         self.log_debug(f"Selected target channels: {self._custom_target_ap_channels}")
 
@@ -160,9 +160,11 @@ class Interceptor:
         print_cmd(f"Running command -> '{BOLD}{cmd}{RESET}'")
         return not os.system(cmd)
 
-    def _set_channel(self, ch_num):
-        os.system(f"iw dev {self.interface} set channel {ch_num}")
+    def _set_channel(self, ch_num) -> bool:
+        if os.system(f"iw dev {self.interface} set channel {ch_num} 2>/dev/null") != 0:
+            return False  # radio stays on its previous channel (e.g. ch14 restricted by regulatory domain)
         self._current_channel_num = ch_num
+        return True
 
     def _get_channels(self) -> List[int]:
         return [int(channel.split('Channel')[1].split(':')[0].strip())
@@ -171,6 +173,16 @@ class Interceptor:
 
     def _get_channel_range(self) -> List[int]:
         return self._custom_target_ap_channels or list(self._channel_range.keys())
+
+    @staticmethod
+    def _get_beacon_declared_channel(pkt) -> Union[int, None]:
+        """Channel number from the frame's own DS Parameter Set element (ID=3)."""
+        elt = pkt[Dot11Elt]
+        while elt and isinstance(elt, Dot11Elt):
+            if elt.ID == 3 and len(elt.info) >= 1:
+                return elt.info[0]  # first byte = channel number
+            elt = elt.payload
+        return None
 
     def _ap_sniff_cb(self, pkt):
         try:
@@ -182,7 +194,12 @@ class Interceptor:
                     return
                 elif self._custom_bssid_addr_is_set() and ap_mac.lower() != self._custom_bssid_addr.lower():
                     return
-                pkt_ch = frequency_to_channel(pkt[RadioTap].Channel)
+                # prefer the channel declared in the beacon's DS Parameter Set (ID=3):
+                # the radiotap frequency only reflects what OUR radio was tuned to,
+                # so adjacent-channel beacons get misattributed with it
+                pkt_ch = self._get_beacon_declared_channel(pkt)
+                if pkt_ch not in self._channel_range:
+                    pkt_ch = frequency_to_channel(pkt[RadioTap].Channel)
                 band_type = BandType.T_50GHZ if pkt_ch > 14 else BandType.T_24GHZ
                 # key by BSSID so that multiple APs sharing the same SSID name are all kept
                 if ap_mac not in self._all_ssids[band_type]:
@@ -204,7 +221,9 @@ class Interceptor:
                         and self._current_channel_num - self._custom_target_ap_last_ch > 2:
                     # make sure sniffing doesn't stop on an overlapped channel for custom SSIDs
                     return
-                self._set_channel(ch_num)
+                if not self._set_channel(ch_num):
+                    print_info(f"Channel {BOLD}{ch_num}{RESET} is not available on this interface, skipping...")
+                    continue
                 print_info(f"Scanning channel {BOLD}{self._current_channel_num}{RESET}, remaining -> "
                            f"{len(channels_to_scan) - (idx + 1)} ", end="\r")
                 sniff(prn=self._ap_sniff_cb, iface=self.interface, timeout=Interceptor._CH_SNIFF_TO,
