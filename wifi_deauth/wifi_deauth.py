@@ -171,6 +171,12 @@ class Interceptor:
             except Exception:
                 print_error(f"Targets file line {line_num}: invalid MAC or channel -> {line}")
                 raise Exception("Bad targets file entry")
+            if ch_num not in self._channel_range:
+                # channel is unsupported by the interface (e.g. 5GHz ch157 on a 2.4GHz-only adapter),
+                # attacking it would be impossible anyway - fail early with a clear message
+                print_error(f"Targets file line {line_num}: channel {ch_num} is not supported by the "
+                            f"network interface, supported channels -> {list(self._channel_range.keys())}")
+                raise Exception("Unsupported channel in targets file")
             band_type = BandType.T_50GHZ if ch_num > 14 else BandType.T_24GHZ
             targets.append(SSID(f"manual:{mac_addr}", mac_addr, band_type))
             targets[-1].add_channel(ch_num)
@@ -299,7 +305,7 @@ class Interceptor:
         # manual targets from the targets file take part in selection as well,
         # they may overlap with scanned ones (dedup by MAC happens after selection)
         for ssid_obj in self._manual_targets:
-            self._channel_range[ssid_obj.channel][ssid_obj.mac_addr] = copy.deepcopy(ssid_obj)
+            self._channel_range.setdefault(ssid_obj.channel, dict())[ssid_obj.mac_addr] = copy.deepcopy(ssid_obj)
 
         pref = '[   ] '
         printf(f"{DELIM}\n"
