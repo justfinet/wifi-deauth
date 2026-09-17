@@ -206,11 +206,12 @@ class Interceptor:
                     return
                 pkt_ch = frequency_to_channel(pkt[RadioTap].Channel)
                 band_type = BandType.T_50GHZ if pkt_ch > 14 else BandType.T_24GHZ
-                if ssid not in self._all_ssids[band_type]:
-                    self._all_ssids[band_type][ssid] = SSID(ssid, ap_mac, band_type)
-                self._all_ssids[band_type][ssid].add_channel(pkt_ch if pkt_ch in self._channel_range else self._current_channel_num)
+                # key by BSSID so that multiple APs sharing the same SSID name are all kept
+                if ap_mac not in self._all_ssids[band_type]:
+                    self._all_ssids[band_type][ap_mac] = SSID(ssid, ap_mac, band_type)
+                self._all_ssids[band_type][ap_mac].add_channel(pkt_ch if pkt_ch in self._channel_range else self._current_channel_num)
                 if self._custom_ssid_name_is_set():
-                    self._custom_target_ap_last_ch = self._all_ssids[band_type][ssid].channel
+                    self._custom_target_ap_last_ch = self._all_ssids[band_type][ap_mac].channel
             else:
                 self._clients_sniff_cb(pkt)  # pass forward to find potential clients
         except Exception as exc:
@@ -237,8 +238,8 @@ class Interceptor:
 
     def _found_custom_ssid_name(self):
         for all_channel_aps in self._all_ssids.values():
-            for ssid_name in all_channel_aps.keys():
-                if ssid_name == self._custom_ssid_name:
+            for ssid_obj in all_channel_aps.values():
+                if ssid_obj.name == self._custom_ssid_name:
                     return True
         return False
 
@@ -251,8 +252,8 @@ class Interceptor:
     def _start_initial_ap_scan(self) -> List[SSID]:
         self._scan_channels_for_aps()
         for band_ssids in self._all_ssids.values():
-            for ssid_name, ssid_obj in band_ssids.items():
-                self._channel_range[ssid_obj.channel][ssid_name] = copy.deepcopy(ssid_obj)
+            for ssid_obj in band_ssids.values():
+                self._channel_range[ssid_obj.channel][ssid_obj.mac_addr] = copy.deepcopy(ssid_obj)
 
         pref = '[   ] '
         printf(f"{DELIM}\n"
@@ -261,7 +262,7 @@ class Interceptor:
         ctr = 0
         target_map: Dict[int, SSID] = dict()
         for channel, all_channel_aps in sorted(self._channel_range.items()):
-            for ssid_name, ssid_obj in all_channel_aps.items():
+            for ssid_obj in all_channel_aps.values():
                 ctr += 1
                 target_map[ctr] = copy.deepcopy(ssid_obj)
                 pref = f"[{str(ctr).rjust(3, ' ')}] "
